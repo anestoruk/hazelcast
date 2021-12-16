@@ -28,6 +28,7 @@ import com.hazelcast.jet.datamodel.Tuple2;
 import com.hazelcast.jet.impl.JobProxy;
 import com.hazelcast.jet.kinesis.impl.AwsConfig;
 import com.hazelcast.jet.pipeline.Pipeline;
+import com.hazelcast.jet.pipeline.Sinks;
 import com.hazelcast.jet.pipeline.StreamSource;
 import com.hazelcast.jet.pipeline.WindowDefinition;
 import com.hazelcast.jet.pipeline.test.AssertionCompletedException;
@@ -57,6 +58,7 @@ import static com.amazonaws.services.kinesis.model.ShardIteratorType.AT_TIMESTAM
 import static com.amazonaws.services.kinesis.model.ShardIteratorType.LATEST;
 import static com.amazonaws.services.kinesis.model.ShardIteratorType.TRIM_HORIZON;
 import static com.hazelcast.jet.aggregate.AggregateOperations.counting;
+import static com.hazelcast.jet.config.ProcessingGuarantee.EXACTLY_ONCE;
 import static com.hazelcast.jet.impl.util.ExceptionUtil.peel;
 import static com.hazelcast.jet.pipeline.test.Assertions.assertCollectedEventually;
 import static java.util.concurrent.TimeUnit.SECONDS;
@@ -117,6 +119,71 @@ public class KinesisIntegrationTest extends AbstractKinesisTest {
     @AfterClass
     public static void afterClass() {
         KINESIS.shutdown();
+    }
+
+    /**
+     * Given real Kinesis is used and Pipeline is consuming records from the stream with IngestionTimestamps
+     * when such pipeline is suspended
+     * and (during the time when Job is suspended) Kinesis stream's shards are split
+     * and afterwards pipeline is resumed and more records are put into the stream
+     * then processing of the Pipeline fails with an exception:
+     * {@code com.hazelcast.jet.JetException: Watermarks not monotonically increasing on queue: last one=X, new one=X}
+     */
+    @Test
+    public void suspendResumeWatermarksException() {
+        HELPER.createStream(2);
+
+        Pipeline pipeline = Pipeline.create();
+        pipeline.readFrom(kinesisSource().build())
+                //.withoutTimestamps() // replacing 'withIngestionTimestamps()' with 'withoutTimestamps()' fixes the issue
+                .withIngestionTimestamps()
+                .map(stringEntry -> stringEntry.getKey() + "@" + new String(stringEntry.getValue()))
+                .writeTo(Sinks.mapWithUpdating(RESULTS, e -> e.split("@")[0],
+                        (oldEntry, newEntry) -> {
+                            if (oldEntry != null) {
+                                throw new AssertionError("duplicated record: '" + oldEntry + "'");
+                            }
+                            return newEntry;
+                        })
+                );
+
+        JobConfig config = new JobConfig();
+        config.setProcessingGuarantee(EXACTLY_ONCE);
+        Job job = hz().getJet().newJob(pipeline, config);
+
+        HELPER.putRecords(messages(0, 50));
+        sleepSeconds(1);
+
+        job.suspend();
+        waitForJobStatus(job, JobStatus.SUSPENDED);
+
+        for (Shard shard : listOpenShards()) {
+            HELPER.waitForStreamToActivate();
+            splitShard(shard);
+        }
+        HELPER.waitForStreamToActivate();
+
+        job.resume();
+        waitForJobStatus(job, JobStatus.RUNNING);
+
+        HELPER.putRecords(messages(50, 100));
+        sleepSeconds(1);
+
+        assertEquals(100, hz().getMap(RESULTS).size());
+    }
+
+    private void waitForJobStatus(Job job, JobStatus expectedStatus) {
+        long startMs = System.currentTimeMillis();
+        JobStatus status = job.getStatus();
+        while (status != expectedStatus) {
+            logger.info(String.format("Waiting for job status: %s (current status: %s)", expectedStatus, status));
+            status = job.getStatus();
+            sleepMillis(10);
+            long elapsedMs = System.currentTimeMillis() - startMs;
+            if (elapsedMs > 1000) {
+                throw new IllegalStateException("Waiting for job status timed out after " + elapsedMs + " ms");
+            }
+        }
     }
 
     @Test
